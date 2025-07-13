@@ -1,0 +1,361 @@
+#!/bin/bash
+# Simple progressive streaming: 1MB->25MB cycles with 3s rest
+# Auto-remount and resume capability
+set -euo pipefail
+
+SRC="$1"
+DEST="$2"
+CHUNK_SIZE=1                   # Start at 1MB
+CYCLE_REST=3                   # 3 second rest between cycles
+
+SRC="$(readlink -f "$SRC")"
+DEST="$(readlink -f "$DEST")"
+
+if [ ! -e "$SRC" ]; then
+    echo "Error: Source '$SRC' does not exist."
+    exit 1
+fi
+
+mkdir -p "$DEST"
+TMPDIR="/dev/shm/memory_copy_$$"
+mkdir -p "$TMPDIR"
+
+# Detect device and partition info at startup
+echo "[*] Analyzing drive configuration..."
+SRC_PARTITION=$(df "$SRC" | tail -1 | awk '{print $1}')
+SRC_MOUNTPOINT=$(df "$SRC" | tail -1 | awk '{print $6}')
+DEST_PARTITION=$(df "$DEST" | tail -1 | awk '{print $1}')
+DEST_MOUNTPOINT=$(df "$DEST" | tail -1 | awk '{print $6}')
+
+# Determine drive types - handle LUKS/encrypted drives
+SRC_IS_REMOVABLE=false
+DEST_IS_REMOVABLE=false
+
+# For LUKS/mapper devices, find the underlying physical device
+get_physical_device() {
+    local partition="$1"
+    
+    if [[ "$partition" =~ ^/dev/mapper/ ]]; then
+        # LUKS encrypted device - find the underlying device
+        local luks_name=$(basename "$partition")
+        if [ -f "/sys/block/dm-*/slaves" ]; then
+            for dm_device in /sys/block/dm-*; do
+                if [ -d "$dm_device/slaves" ]; then
+                    local slave_devices=$(ls "$dm_device/slaves/" 2>/dev/null)
+                    if [ -n "$slave_devices" ]; then
+                        for slave in $slave_devices; do
+                            echo "/dev/$slave"
+                            return 0
+                        done
+                    fi
+                fi
+            done
+        fi
+        # Fallback: try to find via lsblk
+        local underlying=$(lsblk -no PKNAME "$partition" 2>/dev/null | head -1)
+        if [ -n "$underlying" ]; then
+            echo "/dev/$underlying"
+            return 0
+        fi
+    fi
+    
+    # Regular device - strip partition number
+    echo "$partition" | sed 's|[0-9]*$||'
+}
+
+# Get physical devices
+SRC_PHYSICAL=$(get_physical_device "$SRC_PARTITION")
+DEST_PHYSICAL=$(get_physical_device "$DEST_PARTITION")
+
+SRC_DEV_BASE=$(basename "$SRC_PHYSICAL")
+DEST_DEV_BASE=$(basename "$DEST_PHYSICAL")
+
+# Check if source is removable/USB (check the physical device)
+if [ -f "/sys/block/$SRC_DEV_BASE/removable" ]; then
+    if [ "$(cat /sys/block/$SRC_DEV_BASE/removable)" = "1" ]; then
+        SRC_IS_REMOVABLE=true
+    fi
+fi
+
+# Check if destination is removable/USB  
+if [ -f "/sys/block/$DEST_DEV_BASE/removable" ]; then
+    if [ "$(cat /sys/block/$DEST_DEV_BASE/removable)" = "1" ]; then
+        DEST_IS_REMOVABLE=true
+    fi
+fi
+
+echo "[*] Source: $SRC ($SRC_PARTITION -> $SRC_PHYSICAL) - $([ "$SRC_IS_REMOVABLE" = true ] && echo "USB/Removable" || echo "Fixed Drive")"
+echo "[*] Destination: $DEST ($DEST_PARTITION -> $DEST_PHYSICAL) - $([ "$DEST_IS_REMOVABLE" = true ] && echo "USB/Removable" || echo "Fixed Drive")"
+
+# Warn if destination is also removable
+if [ "$DEST_IS_REMOVABLE" = true ]; then
+    echo "[!] WARNING: Destination is also on removable media!"
+fi
+
+# Check if drive is mounted and accessible
+check_drive_status() {
+    if [ ! -e "$SRC" ]; then
+        return 1  # Drive unmounted
+    fi
+    
+    # Try a simple read test
+    dd if="$SRC" of=/dev/null bs=1024 count=1 2>/dev/null || return 1
+    return 0
+}
+
+# Smart remount for already-unlocked encrypted drives
+remount_drive() {
+    echo "[!] Attempting to remount already-unlocked drive..."
+    
+    # For LUKS drives, the mapper device should still exist
+    if [[ "$SRC_PARTITION" =~ ^/dev/mapper/ ]]; then
+        echo "[*] Detected LUKS mapper device: $SRC_PARTITION"
+        
+        # Check if the mapper device still exists (should if drive was just unmounted)
+        if [ -e "$SRC_PARTITION" ]; then
+            echo "[+] Mapper device exists, drive is still unlocked"
+        else
+            echo "[!] Mapper device missing - encryption may need to be unlocked again"
+            return 1
+        fi
+    fi
+    
+    # Wait a moment for system to settle
+    sleep 2
+    
+    # Method 1: Try udisks2 on the actual partition we were using (mapper device)
+    if command -v udisksctl >/dev/null 2>&1; then
+        echo "[*] Trying udisks2 mount on $SRC_PARTITION..."
+        if udisksctl mount -b "$SRC_PARTITION" 2>/dev/null; then
+            echo "[+] Successfully remounted via udisks2"
+            sleep 2
+            return 0
+        else
+            echo "[*] udisks2 failed, trying other methods..."
+        fi
+    fi
+    
+    # Method 2: Try to find if it auto-mounted to a different location
+    echo "[*] Checking if drive auto-mounted elsewhere..."
+    local new_mountpoint=$(findmnt -n -o TARGET "$SRC_PARTITION" 2>/dev/null)
+    if [ -n "$new_mountpoint" ]; then
+        echo "[+] Found drive mounted at: $new_mountpoint"
+        SRC_MOUNTPOINT="$new_mountpoint"
+        return 0
+    fi
+    
+    # Method 3: Try mounting to original mountpoint with different tools
+    if [ ! -d "$SRC_MOUNTPOINT" ]; then
+        echo "[*] Creating mount point $SRC_MOUNTPOINT"
+        mkdir -p "$SRC_MOUNTPOINT" 2>/dev/null || true
+    fi
+    
+    # Try gio mount (what file managers often use)
+    if command -v gio >/dev/null 2>&1; then
+        echo "[*] Trying gio mount..."
+        if gio mount -d "$SRC_PARTITION" 2>/dev/null; then
+            echo "[+] Successfully mounted via gio"
+            sleep 2
+            return 0
+        fi
+    fi
+    
+    # Method 4: Try simple mount without sudo (if user has permissions)
+    echo "[*] Trying direct mount..."
+    if mount "$SRC_PARTITION" "$SRC_MOUNTPOINT" 2>/dev/null; then
+        echo "[+] Successfully mounted directly"
+        sleep 2
+        return 0
+    fi
+    
+    # Method 5: Check if it's actually mounted but we lost track of mountpoint
+    echo "[*] Searching for mounted partition..."
+    local found_mount=$(mount | grep "$SRC_PARTITION" | awk '{print $3}' | head -1)
+    if [ -n "$found_mount" ]; then
+        echo "[+] Found partition mounted at: $found_mount"
+        SRC_MOUNTPOINT="$found_mount"
+        return 0
+    fi
+    
+    echo "[!] All remount attempts failed"
+    echo "[*] The encrypted drive may need to be unlocked again in file manager"
+    return 1
+}
+
+# Wait for drive with intelligent remounting - try automatic for ALL drives
+wait_for_drive() {
+    echo "[!] Source drive not accessible"
+    echo "[*] Attempting automatic remount (like clicking drive icon in file manager)..."
+    
+    # Always try automatic remount first, regardless of drive type
+    local attempt=1
+    while [ $attempt -le 10 ]; do
+        echo "[*] Auto-mount attempt $attempt/10..."
+        
+        if remount_drive; then
+            if check_drive_status; then
+                echo "[+] Successfully remounted and verified source drive"
+                return 0
+            fi
+        fi
+        
+        echo "[*] Waiting 5 seconds before next attempt..."
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    
+    # If automatic failed, give specific advice based on drive type
+    if [ "$SRC_IS_REMOVABLE" = true ]; then
+        echo "[!] Automatic remount failed for removable drive"
+        echo "[*] Please check USB connection or encryption password"
+    else
+        echo "[!] Automatic remount failed for what appears to be a fixed drive"
+        echo "[*] This might be an encrypted removable drive misdetected as fixed"
+        echo "[*] Please check drive connection or unlock encryption"
+    fi
+    
+    echo "[*] Manual options:"
+    echo "[*] 1. Click drive icon in file manager (Thunar)"
+    echo "[*] 2. Or try: sudo mount $SRC_PARTITION $SRC_MOUNTPOINT"
+    
+    # Continue checking every 10 seconds
+    while true; do
+        if check_drive_status; then
+            echo "[+] Drive is accessible again"
+            return 0
+        fi
+        echo "[*] Still waiting for drive access... (checking every 10 seconds)"
+        sleep 10
+    done
+}
+
+# Next chunk size in 1-25MB cycle
+next_chunk_size() {
+    CHUNK_SIZE=$((CHUNK_SIZE + 1))
+    if [ $CHUNK_SIZE -gt 25 ]; then
+        echo "[*] Cycle complete, resting ${CYCLE_REST}s..."
+        sleep $CYCLE_REST
+        CHUNK_SIZE=1
+        echo "[*] New cycle: 1MB->25MB"
+    fi
+}
+
+# Safe read with drive monitoring
+safe_read() {
+    local file="$1"
+    local output="$2"
+    local skip_mb="$3"
+    local count_mb="$4"
+    
+    # Check drive before read
+    if ! check_drive_status; then
+        echo "[!] Drive unmounted during operation!"
+        wait_for_drive
+        echo "[*] Resetting to 1MB chunk size after reconnect"
+        CHUNK_SIZE=1
+    fi
+    
+    # Perform the read
+    if dd if="$file" of="$output" bs=1M count=$count_mb skip=$skip_mb 2>/dev/null; then
+        return 0
+    else
+        # Read failed - check if drive is still there
+        if ! check_drive_status; then
+            echo "[!] Drive unmounted during read!"
+            wait_for_drive
+            echo "[*] Resetting to 1MB chunk size after reconnect"
+            CHUNK_SIZE=1
+            return 1
+        fi
+        
+        # Drive is there but read failed
+        echo "[!] Read failed, drive still connected"
+        return 1
+    fi
+}
+
+# Check if file was partially copied and resume
+get_resume_position() {
+    local dest_file="$1"
+    
+    if [ -f "$dest_file.partial" ]; then
+        local partial_size=$(stat -c%s "$dest_file.partial" 2>/dev/null || echo 0)
+        echo "[*] Found partial file, resuming from $((partial_size/1024/1024))MB"
+        echo $partial_size
+    else
+        echo 0
+    fi
+}
+
+# Progressive copy function
+progressive_copy_file() {
+    local file="$1"
+    local dest="$2"
+    local base="$(basename "$file")"
+    local file_size=$(stat -c%s "$file" 2>/dev/null || echo 0)
+    local copied=$(get_resume_position "$dest/$base")
+    
+    echo "[*] Progressive copy: '$base' ($(($file_size/1024/1024))MB)"
+    
+    mkdir -p "$dest"
+    
+    # If resuming, show current progress
+    if [ $copied -gt 0 ]; then
+        echo "[*] Resuming from $(($copied*100/$file_size))% complete"
+    fi
+    
+    while [ $copied -lt $file_size ]; do
+        local chunk_bytes=$((CHUNK_SIZE * 1024 * 1024))
+        local remaining=$((file_size - copied))
+        
+        # Don't read more than what's left
+        [ $chunk_bytes -gt $remaining ] && chunk_bytes=$remaining
+        
+        echo "[*] Reading ${CHUNK_SIZE}MB chunk..."
+        
+        # Safe read with drive monitoring
+        if safe_read "$file" "$TMPDIR/${base}.chunk" $((copied/1024/1024)) $CHUNK_SIZE; then
+            # Append to partial file
+            cat "$TMPDIR/${base}.chunk" >> "$dest/$base.partial"
+            rm -f "$TMPDIR/${base}.chunk"
+            copied=$((copied + chunk_bytes))
+            echo "[*] Progress: $(($copied*100/$file_size))%"
+            
+            next_chunk_size
+        else
+            echo "[!] Chunk failed, retrying..."
+            sleep 1
+            continue
+        fi
+    done
+    
+    # Finalize file
+    mv "$dest/$base.partial" "$dest/$base"
+    echo "[+] Completed: $base"
+}
+
+# Progressive directory copy
+progressive_copy_dir() {
+    local dir="$1"
+    local dest="$2"
+    
+    find "$dir" -type f | while read -r f; do
+        rel_path="${f#$dir/}"
+        dest_dir="$dest/$(dirname "$rel_path")"
+        progressive_copy_file "$f" "$dest_dir"
+    done
+}
+
+echo "[*] Starting progressive copy (1MB->25MB cycles, ${CYCLE_REST}s rest)"
+echo "[*] Source: $SRC"
+echo "[*] Dest: $DEST"
+echo "[*] Device: $SRC_PARTITION mounted at $SRC_MOUNTPOINT"
+
+if [ -f "$SRC" ]; then
+    progressive_copy_file "$SRC" "$DEST"
+elif [ -d "$SRC" ]; then
+    progressive_copy_dir "$SRC" "$DEST"
+fi
+
+rm -rf "$TMPDIR"
+echo "[+] Progressive copy complete: $DEST"
