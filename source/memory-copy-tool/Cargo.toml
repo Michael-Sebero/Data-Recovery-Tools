@@ -1,0 +1,8 @@
+[package]
+name = "memory-copy-tool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+dirs = "5.0"
+tempfile = "3.0"

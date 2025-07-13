@@ -1,0 +1,72 @@
+[package]
+name = "repair-archive"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "repair-archive"
+path = "src/main.rs"
+
+[dependencies]
+# Core dependencies for archive handling
+zip = "0.6"
+tar = "0.4"
+flate2 = "1.0"
+bzip2 = "0.4"
+
+# Command line interface
+clap = { version = "4.0", features = ["derive"] }
+colored = "2.0"
+
+# Error handling and logging
+anyhow = "1.0"
+thiserror = "1.0"
+log = "0.4"
+env_logger = "0.10"
+
+# Utilities
+walkdir = "2.3"
+indicatif = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Checksums and hashing
+crc32fast = "1.3"
+sha2 = "0.10"
+md5 = "0.7"
+
+# Memory mapping for large files
+memmap2 = "0.5"
+
+# Async support (optional, for future enhancements)
+tokio = { version = "1.0", features = ["full"], optional = true }
+
+# Additional compression formats
+xz2 = { version = "0.1", optional = true }
+zstd = { version = "0.12", optional = true }
+lz4_flex = { version = "0.11", optional = true }
+
+[dev-dependencies]
+tempfile = "3.8"
+criterion = { version = "0.5", features = ["html_reports"] }
+proptest = "1.2"
+
+[features]
+default = ["extended-formats"]
+extended-formats = ["xz2", "zstd", "lz4_flex"]
+async = ["tokio"]
+all = ["extended-formats", "async"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+debug = true
+opt-level = 1
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

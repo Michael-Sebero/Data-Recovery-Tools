@@ -1,0 +1,65 @@
+#!/bin/bash
+
+# Get the directory where this script is located
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+commands=(
+    "Memory Copy Tool"
+    "Recover All"
+    "Repair Archive"
+    "Quit"
+)
+
+selected=0
+
+# Function to display the list and highlight the selected item
+display_list() {
+    clear
+    echo -e "\033[1m  Data Recovery Tools\033[0m\n  -------------------"
+    for i in "${!commands[@]}"; do
+        if [ $i -eq $selected ]; then
+            echo -e "\033[1m➤ ${commands[$i]}\033[0m\n"
+        else
+            echo -e "  ${commands[$i]}\n"
+        fi
+    done
+}
+
+# Function to execute the selected command
+execute_command() {
+    case ${commands[$selected]} in
+        "Memory Copy Tool") 
+            "${SCRIPT_DIR}/tools/memory-copy-tool"
+            read -p "Press Enter to return to the menu..."
+            ;;
+        "Recover All")
+            "${SCRIPT_DIR}/tools/recover-all"
+            read -p "Press Enter to return to the menu..."
+            ;;
+        "Repair Archive")
+            "${SCRIPT_DIR}/tools/repair-archive"
+            read -p "Press Enter to return to the menu..."
+            ;;
+        "Quit") 
+            echo -e "\n\033[1mExiting script\033[0m"
+            exit 0
+            ;;
+        *) 
+            echo -e "\nInvalid selection"
+            ;;
+    esac
+}
+
+# Main loop
+while true; do
+    display_list
+
+    read -sn 1 key
+
+    case $key in
+        "A") ((selected--)); [ $selected -lt 0 ] && selected=$(( ${#commands[@]} - 1 ));;
+        "B") ((selected++)); [ $selected -ge ${#commands[@]} ] && selected=0 ;;
+        "") execute_command ;;
+        *) ;;
+    esac
+done
