@@ -7,6 +7,7 @@ commands=(
     "Memory Copy Tool"
     "Recover All"
     "Repair Archive"
+    "Safe Open"
     "Quit"
 )
 
@@ -40,6 +41,10 @@ execute_command() {
             "${SCRIPT_DIR}/tools/repair-archive"
             read -p "Press Enter to return to the menu..."
             ;;
+        "Safe Open")
+            "${SCRIPT_DIR}/tools/safe-open"
+            read -p "Press Enter to return to the menu..."
+            ;;            
         "Quit") 
             echo -e "\n\033[1mExiting script\033[0m"
             exit 0

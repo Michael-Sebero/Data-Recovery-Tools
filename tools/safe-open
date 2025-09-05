@@ -1,0 +1,177 @@
+#!/bin/bash
+
+# safe-open: Opens files in RAM instead of from storage device
+# Optimized for high-spec hardware with failing/slow storage devices
+# Usage: safe-open <file_path> or safe-open (interactive mode)
+
+safe_open() {
+    # Handle all arguments as a single file path (in case of unquoted spaces)
+    local file_path="$*"
+    
+    # If no arguments provided, enter interactive mode
+    if [ -z "$file_path" ]; then
+        echo "safe-open - Interactive Mode"
+        echo "Enter the full path to the file you want to open:"
+        echo ""
+        echo "Examples:"
+        echo "  /run/media/user/test/&/1.7z"
+        echo "  /run/media/user/test folder/video.mp4"
+        echo "  /run/media/user/USB/passwords.7z"
+        echo ""
+        read -p "File path: " file_path
+        
+        # Check if user provided input
+        if [ -z "$file_path" ]; then
+            echo "No file path provided. Exiting."
+            return 1
+        fi
+        
+        # Remove surrounding quotes if present (user might add them)
+        file_path=$(echo "$file_path" | sed 's/^["'\'']\|["'\'']$//g')
+    fi
+    
+    # Check if file exists
+    if [ ! -f "$file_path" ]; then
+        echo "Error: File '$file_path' does not exist or is not a regular file"
+        return 1
+    fi
+    
+    # Create tmpfs directory if it doesn't exist
+    local tmpfs_dir="/tmp/safe-open-$$"
+    mkdir -p "$tmpfs_dir"
+    
+    # Get filename from full path
+    local filename=$(basename "$file_path")
+    local ram_file_path="$tmpfs_dir/$filename"
+    
+    # Get file size for optimization decisions
+    local file_size=$(stat -c%s "$file_path" 2>/dev/null || echo "0")
+    local file_size_mb=$((file_size / 1024 / 1024))
+    
+    # Optimize copy method based on file size and available tools
+    copy_file_optimized() {
+        # Set nice priority for gentler disk access
+        ionice -c 3 -p $$ 2>/dev/null || true
+        renice 10 $$ 2>/dev/null || true
+        
+        if [ $file_size_mb -gt 100 ] && command -v pv > /dev/null 2>&1; then
+            # Large files: Use pv with massive buffer for maximum speed
+            echo "Copying large file ($file_size_mb MB) to RAM with optimizations..."
+            pv -B 128M -q "$file_path" | dd of="$ram_file_path" bs=128M iflag=fullblock oflag=sync 2>/dev/null
+        elif [ $file_size_mb -gt 50 ] && command -v dd > /dev/null 2>&1; then
+            # Medium files: Use dd with large blocks
+            echo "Copying file ($file_size_mb MB) to RAM..."
+            dd if="$file_path" of="$ram_file_path" bs=64M iflag=fullblock oflag=direct status=none 2>/dev/null
+        elif command -v rsync > /dev/null 2>&1; then
+            # Small files or fallback: Use rsync with optimizations
+            rsync -a --whole-file --inplace "$file_path" "$ram_file_path" 2>/dev/null
+        else
+            # Final fallback
+            cp "$file_path" "$ram_file_path"
+        fi
+    }
+    
+    # Execute copy in background to allow for immediate application launch prep
+    copy_file_optimized &
+    copy_pid=$!
+    
+    # Prepare application launch while copying
+    local app_cmd=""
+    if command -v xdg-open > /dev/null 2>&1; then
+        app_cmd="xdg-open"
+    elif command -v open > /dev/null 2>&1; then
+        app_cmd="open"
+    else
+        echo "Error: No suitable command found to open files (xdg-open or open)"
+        kill $copy_pid 2>/dev/null
+        rm -rf "$tmpfs_dir"
+        return 1
+    fi
+    
+    # Wait for copy to complete
+    wait $copy_pid
+    copy_status=$?
+    
+    if [ $copy_status -ne 0 ]; then
+        echo "Error: Failed to copy file to RAM"
+        rm -rf "$tmpfs_dir"
+        return 1
+    fi
+    
+    # Set up cleanup function
+    cleanup_ram_file() {
+        rm -rf "$tmpfs_dir" 2>/dev/null
+    }
+    
+    # Register cleanup with multiple signals
+    trap cleanup_ram_file EXIT INT TERM QUIT
+    
+    # Launch application immediately after copy completes
+    $app_cmd "$ram_file_path" &
+    
+    # Advanced process monitoring
+    sleep 2
+    
+    # Optimized process detection functions
+    get_file_processes() {
+        local pids=""
+        
+        # Method 1: lsof on entire directory (most reliable)
+        if command -v lsof > /dev/null 2>&1; then
+            pids=$(lsof +D "$tmpfs_dir" 2>/dev/null | awk 'NR>1 {print $2}' | sort -un | tr '\n' ' ')
+        fi
+        
+        # Method 2: fuser as backup
+        if [ -z "$pids" ] && command -v fuser > /dev/null 2>&1; then
+            pids=$(fuser "$ram_file_path" 2>/dev/null | tr -cd '0-9 ')
+        fi
+        
+        # Method 3: Direct file access test
+        if [ -z "$pids" ]; then
+            # Try to get exclusive lock - if it fails, file is in use
+            if ! flock -n "$ram_file_path" true 2>/dev/null; then
+                pids="active"
+            fi
+        fi
+        
+        echo "$pids"
+    }
+    
+    # Efficient monitoring loop
+    while true; do
+        # Get processes using the file
+        file_processes=$(get_file_processes)
+        
+        # If no processes detected, double-check with file move test
+        if [ -z "$file_processes" ] || [ "$file_processes" = " " ]; then
+            # Ultimate test: try to move the file
+            if mv "$ram_file_path" "$ram_file_path.test" 2>/dev/null; then
+                mv "$ram_file_path.test" "$ram_file_path"
+                break
+            fi
+        fi
+        
+        # Verify PIDs are still active (skip if using "active" placeholder)
+        if [ "$file_processes" != "active" ]; then
+            active_count=0
+            for pid in $file_processes; do
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                    active_count=$((active_count + 1))
+                fi
+            done
+            
+            if [ $active_count -eq 0 ]; then
+                break
+            fi
+        fi
+        
+        # Shorter sleep for more responsive cleanup
+        sleep 1
+    done
+}
+
+# If script is being sourced, just define the function
+# If script is being executed directly, run the function with arguments
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    safe_open "$@"
+fi
