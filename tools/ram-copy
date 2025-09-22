@@ -1,7 +1,6 @@
 #!/bin/bash
 # Simple progressive streaming: 1MB->25MB cycles with 3s rest
-# Auto-remount and resume capability for BOTH source and destination
-# Uses D-Bus to trigger automatic mounting like file managers do
+# Auto-remount and resume capability
 set -euo pipefail
 
 SRC="$1"
@@ -64,57 +63,7 @@ get_physical_device() {
     echo "$partition" | sed 's|[0-9]*$||'
 }
 
-# Get the underlying physical partition for LUKS devices
-get_luks_physical_partition() {
-    local mapper_device="$1"
-    
-    if [[ "$mapper_device" =~ ^/dev/mapper/ ]]; then
-        # Find the underlying partition via lsblk
-        local underlying=$(lsblk -no PKNAME "$mapper_device" 2>/dev/null | head -1)
-        if [ -n "$underlying" ]; then
-            echo "/dev/$underlying"
-            return 0
-        fi
-        
-        # Alternative method: check /sys/block
-        if [ -d "/sys/block/dm-*/slaves" ]; then
-            for dm_device in /sys/block/dm-*; do
-                if [ -d "$dm_device/slaves" ]; then
-                    local slave_devices=$(ls "$dm_device/slaves/" 2>/dev/null)
-                    if [ -n "$slave_devices" ]; then
-                        for slave in $slave_devices; do
-                            echo "/dev/$slave"
-                            return 0
-                        done
-                    fi
-                fi
-            done
-        fi
-    fi
-    
-    # Not a mapper device, return as-is
-    echo "$mapper_device"
-}
-
-# Store the original physical partitions for LUKS unlocking
-SRC_PHYSICAL_PARTITION=""
-DEST_PHYSICAL_PARTITION=""
-
-if [[ "$SRC_PARTITION" =~ ^/dev/mapper/ ]]; then
-    SRC_PHYSICAL_PARTITION=$(get_luks_physical_partition "$SRC_PARTITION")
-    echo "[*] Source LUKS mapper: $SRC_PARTITION -> physical: $SRC_PHYSICAL_PARTITION"
-else
-    SRC_PHYSICAL_PARTITION="$SRC_PARTITION"
-fi
-
-if [[ "$DEST_PARTITION" =~ ^/dev/mapper/ ]]; then
-    DEST_PHYSICAL_PARTITION=$(get_luks_physical_partition "$DEST_PARTITION")
-    echo "[*] Destination LUKS mapper: $DEST_PARTITION -> physical: $DEST_PHYSICAL_PARTITION"
-else
-    DEST_PHYSICAL_PARTITION="$DEST_PARTITION"
-fi
-
-# Get physical devices for removable detection
+# Get physical devices
 SRC_PHYSICAL=$(get_physical_device "$SRC_PARTITION")
 DEST_PHYSICAL=$(get_physical_device "$DEST_PARTITION")
 
@@ -143,378 +92,140 @@ if [ "$DEST_IS_REMOVABLE" = true ]; then
     echo "[!] WARNING: Destination is also on removable media!"
 fi
 
-# Check if drive is mounted and accessible (generic version for both src/dest)
+# Check if drive is mounted and accessible
 check_drive_status() {
-    local path="$1"
-    local drive_name="$2"
-    
-    if [ ! -e "$path" ]; then
-        echo "[!] $drive_name path not accessible: $path"
+    if [ ! -e "$SRC" ]; then
         return 1  # Drive unmounted
     fi
     
-    # Try a simple read test for source, write test for destination
-    if [ "$drive_name" = "Source" ]; then
-        dd if="$path" of=/dev/null bs=1024 count=1 2>/dev/null || {
-            echo "[!] $drive_name read test failed"
-            return 1
-        }
-    else
-        # For destination, check if we can write (create a small test file)
-        local test_file="$path/.write_test_$$"
-        if ! echo "test" > "$test_file" 2>/dev/null; then
-            echo "[!] $drive_name write test failed"
-            return 1
-        fi
-        rm -f "$test_file" 2>/dev/null
-    fi
+    # Try a simple read test
+    dd if="$SRC" of=/dev/null bs=1024 count=1 2>/dev/null || return 1
     return 0
 }
 
-# Function to trigger D-Bus device scanning (like when you plug in a drive)
-trigger_device_scan() {
-    echo "[*] Triggering device scan via udev..."
+# Smart remount for already-unlocked encrypted drives
+remount_drive() {
+    echo "[!] Attempting to remount already-unlocked drive..."
     
-    # Trigger udev to rescan the device
-    if command -v udevadm >/dev/null 2>&1; then
-        udevadm trigger --subsystem-match=block 2>/dev/null || true
-        udevadm settle 2>/dev/null || true
-        sleep 2
-    fi
-    
-    # Also try to trigger udisks2 to rescan
-    if command -v gdbus >/dev/null 2>&1; then
-        echo "[*] Asking udisks2 daemon to rescan devices..."
-        # This is what file managers do - ask udisks2 to check for new devices
-        gdbus call --system --dest org.freedesktop.UDisks2 \
-            --object-path /org/freedesktop/UDisks2/Manager \
-            --method org.freedesktop.UDisks2.Manager.GetBlockDevices \
-            '{}' >/dev/null 2>&1 || true
-    fi
-}
-
-# Function to wait for device to appear in udisks2
-wait_for_udisks_device() {
-    local device="$1"
-    local timeout=30
-    local count=0
-    
-    echo "[*] Waiting for device to appear in udisks2: $device"
-    
-    while [ $count -lt $timeout ]; do
-        if command -v gdbus >/dev/null 2>&1; then
-            # Check if udisks2 knows about our device
-            local device_path="/org/freedesktop/UDisks2/block_devices/$(basename "$device" | sed 's|/|_|g')"
-            if gdbus introspect --system --dest org.freedesktop.UDisks2 --object-path "$device_path" >/dev/null 2>&1; then
-                echo "[+] Device found in udisks2: $device_path"
-                return 0
-            fi
-        fi
+    # For LUKS drives, the mapper device should still exist
+    if [[ "$SRC_PARTITION" =~ ^/dev/mapper/ ]]; then
+        echo "[*] Detected LUKS mapper device: $SRC_PARTITION"
         
-        sleep 1
-        count=$((count + 1))
-    done
-    
-    echo "[!] Device not found in udisks2 after ${timeout}s"
-    return 1
-}
-
-# Non-interactive mounting using desktop environment methods (like Thunar does)
-remount_drive_system() {
-    local physical_partition="$1"
-    local drive_name="$2"
-    
-    echo "[!] Attempting to remount $drive_name drive using desktop methods..."
-    echo "[*] Physical partition: $physical_partition"
-    
-    # First, trigger device scanning
-    trigger_device_scan
-    
-    # Method 0: Try to notify the desktop environment about the device
-    if [ -n "$DISPLAY" ] && [ -n "$USER" ]; then
-        echo "[*] Attempting desktop environment notification..."
-        
-        # Try to trigger a desktop notification about the new device
-        # This simulates what happens when you plug in a drive
-        if command -v notify-send >/dev/null 2>&1; then
-            notify-send "Drive Reconnection" "Attempting to remount $drive_name drive..." --icon=drive-removable-media 2>/dev/null || true
-        fi
-        
-        # Try to use gvfs-mount (what desktop environments often use)
-        if command -v gvfs-mount >/dev/null 2>&1; then
-            echo "[*] Trying gvfs-mount (desktop environment method)..."
-            if gvfs-mount -d "$physical_partition" 2>/dev/null; then
-                echo "[+] Successfully mounted via gvfs-mount"
-                sleep 3
-                
-                local new_mountpoint=$(findmnt -n -o TARGET "$physical_partition" 2>/dev/null)
-                if [ -z "$new_mountpoint" ]; then
-                    # For LUKS, check mapper devices
-                    local mapper_devices=$(ls /dev/mapper/ 2>/dev/null | grep -v control)
-                    for mapper in $mapper_devices; do
-                        local full_mapper="/dev/mapper/$mapper"
-                        if new_mountpoint=$(findmnt -n -o TARGET "$full_mapper" 2>/dev/null); then
-                            if [[ "$new_mountpoint" =~ ^/run/media/ ]] || [[ "$new_mountpoint" =~ ^/media/ ]]; then
-                                physical_partition="$full_mapper"
-                                break
-                            fi
-                        fi
-                    done
-                fi
-                
-                if [ -n "$new_mountpoint" ]; then
-                    update_drive_paths "$drive_name" "$physical_partition" "$new_mountpoint"
-                    return 0
-                fi
-            fi
-        fi
-        
-        # Try to open the file manager to the device (this often triggers auto-mount)
-        if command -v thunar >/dev/null 2>&1; then
-            echo "[*] Attempting to trigger Thunar to recognize device..."
-            # Open thunar to computer:// which shows drives and may trigger recognition
-            thunar computer:// 2>/dev/null &
-            local thunar_pid=$!
-            sleep 3
-            kill $thunar_pid 2>/dev/null || true
-            
-            # Check if this triggered a mount
-            local new_mountpoint=$(findmnt -n -o TARGET "$physical_partition" 2>/dev/null)
-            if [ -n "$new_mountpoint" ]; then
-                echo "[+] Thunar triggered successful mount"
-                update_drive_paths "$drive_name" "$physical_partition" "$new_mountpoint"
-                return 0
-            fi
-        fi
-    else
-        echo "[*] No desktop environment detected (no DISPLAY or USER)"
-    fi
-    
-    # Method 2: Try dmsetup for LUKS devices (what we saw in bpftrace)
-    if [[ "$SRC_PARTITION" =~ ^/dev/mapper/ ]] || [[ "$DEST_PARTITION" =~ ^/dev/mapper/ ]]; then
-        if command -v dmsetup >/dev/null 2>&1; then
-            echo "[*] Trying dmsetup for LUKS device..."
-            
-            # Check if there are any inactive mapper devices that could be our drive
-            local inactive_mappers=$(dmsetup info -c --noheadings -o name,attr 2>/dev/null | grep "^luks-" | awk '{print $1}')
-            for mapper_name in $inactive_mappers; do
-                local full_mapper="/dev/mapper/$mapper_name"
-                
-                # Try to activate/resume the mapper device
-                if dmsetup resume "$mapper_name" 2>/dev/null; then
-                    echo "[+] Successfully resumed dmsetup device: $mapper_name"
-                    
-                    # Now try to mount it
-                    if command -v udisksctl >/dev/null 2>&1; then
-                        if udisksctl mount -b "$full_mapper" 2>/dev/null; then
-                            echo "[+] Successfully mounted resumed mapper device"
-                            local new_mountpoint=$(findmnt -n -o TARGET "$full_mapper" 2>/dev/null)
-                            if [ -n "$new_mountpoint" ]; then
-                                update_drive_paths "$drive_name" "$full_mapper" "$new_mountpoint"
-                                return 0
-                            fi
-                        fi
-                    fi
-                fi
-            done
-        fi
-    fi
-    if command -v pmount >/dev/null 2>&1; then
-        echo "[*] Trying pmount for removable device..."
-        local mount_label=$(basename "$physical_partition")
-        if pmount "$physical_partition" "$mount_label" 2>/dev/null; then
-            echo "[+] Successfully mounted via pmount"
-            local new_mountpoint="/media/$mount_label"
-            if [ -d "$new_mountpoint" ]; then
-                update_drive_paths "$drive_name" "$physical_partition" "$new_mountpoint"
-                return 0
-            fi
+        # Check if the mapper device still exists (should if drive was just unmounted)
+        if [ -e "$SRC_PARTITION" ]; then
+            echo "[+] Mapper device exists, drive is still unlocked"
+        else
+            echo "[!] Mapper device missing - encryption may need to be unlocked again"
+            return 1
         fi
     fi
     
-    # Method 3: Try pmount (if available) - designed for removable media
-    echo "[*] Checking if device auto-mounted..."
-    sleep 3  # Give time for auto-mount
+    # Wait a moment for system to settle
+    sleep 2
     
-    # Look for any new mounts in /run/media or /media
-    local possible_mounts=$(mount | grep -E "^${physical_partition}|^/dev/mapper/" | awk '{print $3}' || true)
-    for mountpoint in $possible_mounts; do
-        if [[ "$mountpoint" =~ ^/run/media/ ]] || [[ "$mountpoint" =~ ^/media/ ]]; then
-            local mounted_device=$(mount | grep " $mountpoint " | awk '{print $1}' | head -1)
-            echo "[+] Found auto-mounted device: $mounted_device at $mountpoint"
-            update_drive_paths "$drive_name" "$mounted_device" "$mountpoint"
+    # Method 1: Try udisks2 on the actual partition we were using (mapper device)
+    if command -v udisksctl >/dev/null 2>&1; then
+        echo "[*] Trying udisks2 mount on $SRC_PARTITION..."
+        if udisksctl mount -b "$SRC_PARTITION" 2>/dev/null; then
+            echo "[+] Successfully remounted via udisks2"
+            sleep 2
             return 0
-        fi
-    done
-    
-    # Method 4: Check if it auto-mounted after device scan
-    if command -v dbus-send >/dev/null 2>&1; then
-        echo "[*] Trying to trigger udisks2 mount via D-Bus..."
-        # Get the udisks2 object path for our device
-        local device_name=$(basename "$physical_partition")
-        local device_path="/org/freedesktop/UDisks2/block_devices/${device_name}"
-        
-        # Try to call the Mount method on the filesystem interface
-        if dbus-send --system --print-reply \
-            --dest=org.freedesktop.UDisks2 \
-            "${device_path}" \
-            org.freedesktop.UDisks2.Filesystem.Mount \
-            'dict:string:variant:' 2>/dev/null; then
-            echo "[+] Successfully triggered udisks2 mount"
-            sleep 3
-            local new_mountpoint=$(findmnt -n -o TARGET "$physical_partition" 2>/dev/null)
-            if [ -n "$new_mountpoint" ]; then
-                update_drive_paths "$drive_name" "$physical_partition" "$new_mountpoint"
-                return 0
-            fi
+        else
+            echo "[*] udisks2 failed, trying other methods..."
         fi
     fi
     
-    # Method 4: Try udisks --mount (older udisks1 compatibility)
-    if command -v udisks >/dev/null 2>&1; then
-        echo "[*] Trying legacy udisks mount..."
-        if udisks --mount "$physical_partition" 2>/dev/null; then
-            echo "[+] Successfully mounted via udisks (v1)"
-            local new_mountpoint=$(findmnt -n -o TARGET "$physical_partition" 2>/dev/null)
-            if [ -n "$new_mountpoint" ]; then
-                update_drive_paths "$drive_name" "$physical_partition" "$new_mountpoint"
-                return 0
-            fi
-        fi
-    fi
-    
-    # Method 5: Try manual mount to /mnt (last resort)
-    echo "[*] Trying manual mount to /mnt..."
-    local temp_mountpoint="/mnt/temp_$(basename "$physical_partition")_$$"
-    if mkdir -p "$temp_mountpoint" 2>/dev/null; then
-        if mount "$physical_partition" "$temp_mountpoint" 2>/dev/null; then
-            echo "[+] Successfully mounted to temporary location: $temp_mountpoint"
-            update_drive_paths "$drive_name" "$physical_partition" "$temp_mountpoint"
-            return 0
-        fi
-        rmdir "$temp_mountpoint" 2>/dev/null || true
-    fi
-    
-    echo "[!] All mounting attempts failed"
-    return 1
-}
-
-# Update drive paths after successful remount
-update_drive_paths() {
-    local drive_name="$1"
-    local new_partition="$2"
-    local new_mountpoint="$3"
-    
-    echo "[*] Updating $drive_name paths..."
-    echo "[*] New partition: $new_partition"
-    echo "[*] New mountpoint: $new_mountpoint"
-    
-    if [ "$drive_name" = "Source" ]; then
-        # Update source variables and path
-        local old_mount_escaped=$(echo "$SRC_MOUNTPOINT" | sed 's|/|\\/|g')
-        local new_mount_escaped=$(echo "$new_mountpoint" | sed 's|/|\\/|g')
-        SRC_PARTITION="$new_partition"
+    # Method 2: Try to find if it auto-mounted to a different location
+    echo "[*] Checking if drive auto-mounted elsewhere..."
+    local new_mountpoint=$(findmnt -n -o TARGET "$SRC_PARTITION" 2>/dev/null)
+    if [ -n "$new_mountpoint" ]; then
+        echo "[+] Found drive mounted at: $new_mountpoint"
         SRC_MOUNTPOINT="$new_mountpoint"
-        SRC=$(echo "$SRC" | sed "s|$old_mount_escaped|$new_mount_escaped|")
-        echo "[*] Updated source path: $SRC"
-    else
-        # Update destination variables and path
-        local old_mount_escaped=$(echo "$DEST_MOUNTPOINT" | sed 's|/|\\/|g')
-        local new_mount_escaped=$(echo "$new_mountpoint" | sed 's|/|\\/|g')
-        DEST_PARTITION="$new_partition"
-        DEST_MOUNTPOINT="$new_mountpoint"
-        DEST=$(echo "$DEST" | sed "s|$old_mount_escaped|$new_mount_escaped|")
-        echo "[*] Updated destination path: $DEST"
+        return 0
     fi
+    
+    # Method 3: Try mounting to original mountpoint with different tools
+    if [ ! -d "$SRC_MOUNTPOINT" ]; then
+        echo "[*] Creating mount point $SRC_MOUNTPOINT"
+        mkdir -p "$SRC_MOUNTPOINT" 2>/dev/null || true
+    fi
+    
+    # Try gio mount (what file managers often use)
+    if command -v gio >/dev/null 2>&1; then
+        echo "[*] Trying gio mount..."
+        if gio mount -d "$SRC_PARTITION" 2>/dev/null; then
+            echo "[+] Successfully mounted via gio"
+            sleep 2
+            return 0
+        fi
+    fi
+    
+    # Method 4: Try simple mount without sudo (if user has permissions)
+    echo "[*] Trying direct mount..."
+    if mount "$SRC_PARTITION" "$SRC_MOUNTPOINT" 2>/dev/null; then
+        echo "[+] Successfully mounted directly"
+        sleep 2
+        return 0
+    fi
+    
+    # Method 5: Check if it's actually mounted but we lost track of mountpoint
+    echo "[*] Searching for mounted partition..."
+    local found_mount=$(mount | grep "$SRC_PARTITION" | awk '{print $3}' | head -1)
+    if [ -n "$found_mount" ]; then
+        echo "[+] Found partition mounted at: $found_mount"
+        SRC_MOUNTPOINT="$found_mount"
+        return 0
+    fi
+    
+    echo "[!] All remount attempts failed"
+    echo "[*] The encrypted drive may need to be unlocked again in file manager"
+    return 1
 }
 
-# Wait for drive with non-interactive remounting
+# Wait for drive with intelligent remounting - try automatic for ALL drives
 wait_for_drive() {
-    local path="$1"
-    local partition="$2" 
-    local mountpoint="$3"
-    local drive_name="$4"
-    local is_removable="$5"
-    local physical_partition="$6"
+    echo "[!] Source drive not accessible"
+    echo "[*] Attempting automatic remount (like clicking drive icon in file manager)..."
     
-    echo "[!] $drive_name drive not accessible"
-    echo "[*] Attempting automatic remount (non-interactive)..."
-    
-    # Try non-interactive system mounting
+    # Always try automatic remount first, regardless of drive type
     local attempt=1
-    while [ $attempt -le 3 ]; do
-        echo "[*] System mount attempt $attempt/3 for $drive_name..."
+    while [ $attempt -le 10 ]; do
+        echo "[*] Auto-mount attempt $attempt/10..."
         
-        if remount_drive_system "$physical_partition" "$drive_name"; then
-            # Give it a moment to settle
-            sleep 3
-            if check_drive_status "$path" "$drive_name"; then
-                echo "[+] Successfully remounted and verified $drive_name drive"
+        if remount_drive; then
+            if check_drive_status; then
+                echo "[+] Successfully remounted and verified source drive"
                 return 0
-            else
-                echo "[*] Mount succeeded but original path not accessible"
-                echo "[*] This is normal - checking if file exists in new location..."
-                
-                # For source drives, try to find the file in the new mount location
-                if [ "$drive_name" = "Source" ]; then
-                    local basename_file=$(basename "$path")
-                    local dirname_file=$(dirname "$path")
-                    local relative_path=${dirname_file#$mountpoint}
-                    local new_file_path="$SRC_MOUNTPOINT$relative_path/$basename_file"
-                    
-                    if [ -e "$new_file_path" ]; then
-                        echo "[+] Found file in new location: $new_file_path"
-                        SRC="$new_file_path"
-                        return 0
-                    fi
-                fi
-                
-                # For destination drives, just update the directory
-                if [ "$drive_name" = "Destination" ]; then
-                    local relative_path=${path#$mountpoint}
-                    local new_dest_path="$DEST_MOUNTPOINT$relative_path"
-                    echo "[*] Updated destination to: $new_dest_path"
-                    DEST="$new_dest_path"
-                    mkdir -p "$DEST" 2>/dev/null || true
-                    return 0
-                fi
             fi
         fi
         
-        echo "[*] Waiting 10 seconds before next attempt..."
-        sleep 10
+        echo "[*] Waiting 5 seconds before next attempt..."
+        sleep 5
         attempt=$((attempt + 1))
     done
     
-    # If automatic failed, give advice
-    if [[ "$partition" =~ ^/dev/mapper/ ]]; then
-        echo "[!] Automatic LUKS mount failed for $drive_name drive"
-        echo "[*] LUKS encrypted drives may need manual unlocking"
-        echo "[*] The drive was previously unlocked, but the encryption session expired"
-    elif [ "$is_removable" = true ]; then
-        echo "[!] Automatic remount failed for removable $drive_name drive"
-        echo "[*] Please check USB connection or try reconnecting the drive"
+    # If automatic failed, give specific advice based on drive type
+    if [ "$SRC_IS_REMOVABLE" = true ]; then
+        echo "[!] Automatic remount failed for removable drive"
+        echo "[*] Please check USB connection or encryption password"
     else
-        echo "[!] Automatic remount failed for fixed $drive_name drive"
-        echo "[*] Please check drive connection"
+        echo "[!] Automatic remount failed for what appears to be a fixed drive"
+        echo "[*] This might be an encrypted removable drive misdetected as fixed"
+        echo "[*] Please check drive connection or unlock encryption"
     fi
     
-    echo "[*] Manual options for $drive_name:"
-    echo "[*] 1. Click drive icon in file manager (Thunar) to unlock/mount"
-    echo "[*] 2. Reconnect the USB drive if it's removable"
-    if [[ "$partition" =~ ^/dev/mapper/ ]]; then
-        echo "[*] 3. For encrypted drives, you may need to re-enter the password"
-    fi
+    echo "[*] Manual options:"
+    echo "[*] 1. Click drive icon in file manager (Thunar)"
+    echo "[*] 2. Or try: sudo mount $SRC_PARTITION $SRC_MOUNTPOINT"
     
-    # Continue checking every 15 seconds (longer for manual intervention)
+    # Continue checking every 10 seconds
     while true; do
-        if check_drive_status "$path" "$drive_name"; then
-            echo "[+] $drive_name drive is accessible again"
+        if check_drive_status; then
+            echo "[+] Drive is accessible again"
             return 0
         fi
-        echo "[*] Still waiting for $drive_name drive access... (checking every 15 seconds)"
-        echo "[*] Please use file manager to unlock/mount the drive"
-        sleep 15
+        echo "[*] Still waiting for drive access... (checking every 10 seconds)"
+        sleep 10
     done
 }
 
@@ -536,14 +247,12 @@ safe_read() {
     local skip_mb="$3"
     local count_mb="$4"
     
-    # Check source drive before read
-    if ! check_drive_status "$SRC" "Source"; then
-        echo "[!] Source drive unmounted during operation!"
-        wait_for_drive "$SRC" "$SRC_PARTITION" "$SRC_MOUNTPOINT" "Source" "$SRC_IS_REMOVABLE" "$SRC_PHYSICAL_PARTITION"
+    # Check drive before read
+    if ! check_drive_status; then
+        echo "[!] Drive unmounted during operation!"
+        wait_for_drive
         echo "[*] Resetting to 1MB chunk size after reconnect"
         CHUNK_SIZE=1
-        # Update file path in case it changed
-        file="$SRC"
     fi
     
     # Perform the read
@@ -551,54 +260,16 @@ safe_read() {
         return 0
     else
         # Read failed - check if drive is still there
-        if ! check_drive_status "$SRC" "Source"; then
-            echo "[!] Source drive unmounted during read!"
-            wait_for_drive "$SRC" "$SRC_PARTITION" "$SRC_MOUNTPOINT" "Source" "$SRC_IS_REMOVABLE" "$SRC_PHYSICAL_PARTITION"
+        if ! check_drive_status; then
+            echo "[!] Drive unmounted during read!"
+            wait_for_drive
             echo "[*] Resetting to 1MB chunk size after reconnect"
             CHUNK_SIZE=1
             return 1
         fi
         
         # Drive is there but read failed
-        echo "[!] Read failed, source drive still connected"
-        return 1
-    fi
-}
-
-# Safe write with destination drive monitoring
-safe_write() {
-    local input="$1"
-    local dest_file="$2"
-    
-    # Check destination drive before write
-    if ! check_drive_status "$DEST" "Destination"; then
-        echo "[!] Destination drive unmounted during operation!"
-        wait_for_drive "$DEST" "$DEST_PARTITION" "$DEST_MOUNTPOINT" "Destination" "$DEST_IS_REMOVABLE" "$DEST_PHYSICAL_PARTITION"
-        echo "[*] Resetting to 1MB chunk size after reconnect"
-        CHUNK_SIZE=1
-        # Update dest_file path in case DEST changed
-        local basename_file=$(basename "$dest_file")
-        dest_file="$DEST/$basename_file"
-    fi
-    
-    # Ensure destination directory exists
-    mkdir -p "$(dirname "$dest_file")" 2>/dev/null || true
-    
-    # Perform the write
-    if cat "$input" >> "$dest_file"; then
-        return 0
-    else
-        # Write failed - check if destination drive is still there
-        if ! check_drive_status "$DEST" "Destination"; then
-            echo "[!] Destination drive unmounted during write!"
-            wait_for_drive "$DEST" "$DEST_PARTITION" "$DEST_MOUNTPOINT" "Destination" "$DEST_IS_REMOVABLE" "$DEST_PHYSICAL_PARTITION"
-            echo "[*] Resetting to 1MB chunk size after reconnect"
-            CHUNK_SIZE=1
-            return 1
-        fi
-        
-        # Drive is there but write failed
-        echo "[!] Write failed, destination drive still connected"
+        echo "[!] Read failed, drive still connected"
         return 1
     fi
 }
@@ -644,21 +315,15 @@ progressive_copy_file() {
         
         # Safe read with drive monitoring
         if safe_read "$file" "$TMPDIR/${base}.chunk" $((copied/1024/1024)) $CHUNK_SIZE; then
-            # Safe write to destination with drive monitoring
-            if safe_write "$TMPDIR/${base}.chunk" "$dest/$base.partial"; then
-                rm -f "$TMPDIR/${base}.chunk"
-                copied=$((copied + chunk_bytes))
-                echo "[*] Progress: $(($copied*100/$file_size))%"
-                
-                next_chunk_size
-            else
-                echo "[!] Write chunk failed, retrying..."
-                rm -f "$TMPDIR/${base}.chunk" 2>/dev/null
-                sleep 1
-                continue
-            fi
+            # Append to partial file
+            cat "$TMPDIR/${base}.chunk" >> "$dest/$base.partial"
+            rm -f "$TMPDIR/${base}.chunk"
+            copied=$((copied + chunk_bytes))
+            echo "[*] Progress: $(($copied*100/$file_size))%"
+            
+            next_chunk_size
         else
-            echo "[!] Read chunk failed, retrying..."
+            echo "[!] Chunk failed, retrying..."
             sleep 1
             continue
         fi
@@ -684,8 +349,7 @@ progressive_copy_dir() {
 echo "[*] Starting progressive copy (1MB->25MB cycles, ${CYCLE_REST}s rest)"
 echo "[*] Source: $SRC"
 echo "[*] Dest: $DEST"
-echo "[*] Source device: $SRC_PARTITION mounted at $SRC_MOUNTPOINT"
-echo "[*] Destination device: $DEST_PARTITION mounted at $DEST_MOUNTPOINT"
+echo "[*] Device: $SRC_PARTITION mounted at $SRC_MOUNTPOINT"
 
 if [ -f "$SRC" ]; then
     progressive_copy_file "$SRC" "$DEST"
