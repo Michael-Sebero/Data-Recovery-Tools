@@ -13,7 +13,10 @@ commands=(
 )
 
 # Sort commands alphabetically but keep "Quit" at the bottom
-sorted_commands=($(printf "%s\n" "${commands[@]}" | grep -v "Quit" | sort))
+sorted_commands=()
+while IFS= read -r line; do
+    sorted_commands+=("$line")
+done < <(printf "%s\n" "${commands[@]}" | grep -v "Quit" | sort)
 sorted_commands+=("Quit")
 
 commands=("${sorted_commands[@]}")  # Replace original with sorted
