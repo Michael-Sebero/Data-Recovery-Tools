@@ -44,7 +44,7 @@ execute_command() {
             read -p "Press Enter to return to the menu..."
             ;;
         "Recover Deleted")
-            "${SCRIPT_DIR}/tools/recover-deleted"
+            sudo "${SCRIPT_DIR}/tools/recover-deleted"
             read -p "Press Enter to return to the menu..."
             ;;
         "Repair Archive")
@@ -68,9 +68,7 @@ execute_command() {
 # Main loop
 while true; do
     display_list
-
     read -sn 1 key
-
     case $key in
         "A") ((selected--)); [ $selected -lt 0 ] && selected=$(( ${#commands[@]} - 1 ));;
         "B") ((selected++)); [ $selected -ge ${#commands[@]} ] && selected=0 ;;
