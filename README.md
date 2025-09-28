@@ -11,5 +11,5 @@ This program is a gentle file/directory copying program designed for data recove
 ## Repair Archive
 This program is a universal archive recovery tool that can detect, diagnose, and repair corrupted archive files `.zip .tar .gzip .bzip2 .7z .rar` by implementing various repair strategies like fixing end-of-file records, rebuilding central directories and recovering partial data.
 
-## Recover Deleted
-This program attempts to recover deleted files from a Linux filesystem by searching for file signatures in unallocated disk space, using debugfs to find deleted inodes and scanning partitions directly for recoverable data.
+## Safe Open
+This program opens up archives and media in a dying drive safely.

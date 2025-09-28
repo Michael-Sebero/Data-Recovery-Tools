@@ -6,7 +6,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Original commands
 commands=(
     "RAM Copy"
-    "Recover Deleted"
     "Repair Archive"
     "Safe Open"
     "Quit"
@@ -41,10 +40,6 @@ execute_command() {
     case ${commands[$selected]} in
         "RAM Copy") 
             "${SCRIPT_DIR}/tools/ram-copy"
-            read -p "Press Enter to return to the menu..."
-            ;;
-        "Recover Deleted")
-            sudo "${SCRIPT_DIR}/tools/recover-deleted"
             read -p "Press Enter to return to the menu..."
             ;;
         "Repair Archive")
